@@ -74,8 +74,13 @@ static int nccltype = ncclFloat;
 static int ncclroot = 0;
 static int parallel_init = 0;
 static int blocking_coll = 0;
+<<<<<<< HEAD
 static int streamnull = 0;
 static int timeout = 0;
+=======
+static int slow_rank = -1;
+static int slow_rank_usec = 100000;
+>>>>>>> 1cd880b (add slow rank simulation options)
 static int cudaGraphLaunches = 0;
 static int report_cputime = 0;
 // Report average iteration time: (0=RANK0,1=AVG,2=MIN,3=MAX)
@@ -420,6 +425,10 @@ testResult_t startColl(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
       NCCLCHECK(ncclRedOpCreatePreMulSum(&op, &u64, type, ncclScalarHostImmediate, args->comms[i]));
     }
     #endif
+
+    if (slow_rank == rank) {
+        usleep(slow_rank_usec);
+    }
 
     TESTCHECK(args->collTest->runColl(
           (void*)(in_place ? recvBuff + args->sendInplaceOffset*rank : sendBuff),
@@ -780,13 +789,15 @@ int main(int argc, char* argv[]) {
     {"cudagraph", required_argument, 0, 'G'},
     {"report_cputime", required_argument, 0, 'C'},
     {"average", required_argument, 0, 'a'},
+    {"slowrank", required_argument, 0, 'S'},
+    {"slowrank_delay", required_argument, 0, 'D'},
     {"help", no_argument, 0, 'h'},
     {}
   };
 
   while(1) {
     int c;
-    c = getopt_long(argc, argv, "t:g:b:e:i:f:n:m:w:p:c:o:d:r:z:y:T:hG:C:a:", longopts, &longindex);
+    c = getopt_long(argc, argv, "t:g:b:e:i:f:n:m:w:p:c:o:d:r:z:y:T:hG:C:a:S:D:", longopts, &longindex);
 
     if (c == -1)
       break;
@@ -857,6 +868,12 @@ int main(int argc, char* argv[]) {
       case 'T':
         timeout = strtol(optarg, NULL, 0);
         break;
+      case 'S':
+        slow_rank= (int)strtol(optarg, NULL, 0);
+        break;
+      case 'D':
+        slow_rank_usec= strtol(optarg, NULL, 0);
+        break;
       case 'G':
 #if (NCCL_MAJOR > 2 || (NCCL_MAJOR >= 2 && NCCL_MINOR >= 9)) && CUDART_VERSION >= 11030
         cudaGraphLaunches = strtol(optarg, NULL, 0);
@@ -900,6 +917,8 @@ int main(int argc, char* argv[]) {
             "[-G,--cudagraph <num graph launches>] \n\t"
             "[-C,--report_cputime <0/1>] \n\t"
             "[-a,--average <0/1/2/3> report average iteration time <0=RANK0/1=AVG/2=MIN/3=MAX>] \n\t"
+            "[-S slowrank <rank>] slow rank (default is disabled) \n\t"
+            "[-D slowrank_delay <usec>] slow rank delay usec \n\t"
             "[-h,--help]\n",
           basename(argv[0]));
         return 0;
