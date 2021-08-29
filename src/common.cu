@@ -221,6 +221,53 @@ void Allreduce(struct threadArgs* args, T* value, int average) {
   epoch ^= 1;
 }
 
+// Inter-thread/process barrier+geather data for each thread
+void Gather(struct threadArgs* args, double value) {
+  while (args->barrier[args->barrier_idx] != args->thread) pthread_yield();
+
+  args->gather[args->thread] = value;
+  args->barrier[args->barrier_idx] = args->thread + 1;
+  if (args->thread+1 == args->nThreads) {
+#ifdef MPI_SUPPORT
+    MPI_Gather((void*)args->gather, args->nThreads, MPI_DOUBLE, (void*)args->gather, args->nThreads, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+#endif
+    args->barrier[args->barrier_idx] = 0;
+  } else {
+    while (args->barrier[args->barrier_idx]) pthread_yield();
+  }
+  args->barrier_idx=!args->barrier_idx;
+#ifdef DEBUG_PRINT
+ int nGathers = args->nProcs *args->nThreads;
+ PRINT("\n Gather result: ");
+  for (int i=0; i<nGathers; i++) {
+    PRINT("  %7f", args->gather[i]);
+  }
+  PRINT("\n");
+#endif
+}
+
+// Return minMaxAvg={min, max, avg} minMaxIdx={minIdx, maxIdx} for given vector
+void getMinMaxAvg(double *values, int nr, double minMaxAvg[3], int minMaxIdx[2])
+{
+  int i;
+
+  minMaxAvg[0] = minMaxAvg[1] = minMaxAvg[2] = values[0];
+  minMaxIdx[0] = minMaxIdx [1] = 0;
+
+  for (i=1; i<nr; i++) {
+    if (minMaxAvg[0]  > values[i]) {
+      minMaxAvg[0] = values[i];
+      minMaxIdx[0] = i;
+    }
+    if (minMaxAvg[1]  < values[i]) {
+      minMaxAvg[1] = values[i];
+      minMaxIdx[1] = i;
+    }
+    minMaxAvg[2] += values[i];
+  }
+  minMaxAvg[2] /= nr;
+}
+
 testResult_t CheckData(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t op, int root, int in_place, int64_t *wrongElts) {
   int nranks = args->nProcs*args->nGpus*args->nThreads;
   size_t count = args->expectedBytes/wordSize(type);
@@ -402,6 +449,19 @@ testResult_t completeColl(struct threadArgs* args) {
   return testSuccess;
 }
 
+
+void sec2string(double timeSec, char *timeStr) {
+  double timeUsec = timeSec *1.0E6;
+
+  if (timeUsec >= 10000.0) {
+    sprintf(timeStr, "%7.0f", timeUsec);
+  } else if (timeUsec >= 100.0) {
+    sprintf(timeStr, "%7.1f", timeUsec);
+  } else {
+    sprintf(timeStr, "%7.2f", timeUsec);
+  }
+}
+
 testResult_t BenchTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t op, int root, int in_place) {
   size_t count = args->nbytes / wordSize(type);
   if (datacheck) {
@@ -464,10 +524,28 @@ testResult_t BenchTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
   double cputimeSec = tim.elapsed()/(iters*agg_iters);
   TESTCHECK(completeColl(args));
 
-  double deltaSec = tim.elapsed();
+  auto delta = std::chrono::high_resolution_clock::now() - start;
+  double deltaSec = std::chrono::duration_cast<std::chrono::duration<double>>(delta).count();
+  int nGather = args->nProcs*args->nThreads;
+  double minMaxAvg[3];
+  int minMaxIdx[2];
+
   deltaSec = deltaSec/(iters*agg_iters);
   if (cudaGraphLaunches >= 1) deltaSec = deltaSec/cudaGraphLaunches;
-  Allreduce(args, &deltaSec, average);
+  Gather(args, deltaSec);
+  getMinMaxAvg((double *)args->gather, nGather, minMaxAvg, minMaxIdx);
+
+  switch(average){
+  case 1:
+    deltaSec = minMaxAvg[2];
+    break;
+  case 2:
+    deltaSec = minMaxAvg[1];
+    break;
+  case 3:
+    deltaSec = minMaxAvg[0];
+    break;
+  }
 
 #if CUDART_VERSION >= 11030
   if (cudaGraphLaunches >= 1) {
@@ -540,21 +618,18 @@ testResult_t BenchTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
       wrongElts = wrongElts1;
   }
 
-  double timeUsec = (report_cputime ? cputimeSec : deltaSec)*1.0E6;
-  char timeStr[100];
-  if (timeUsec >= 10000.0) {
-    sprintf(timeStr, "%7.0f", timeUsec);
-  } else if (timeUsec >= 100.0) {
-    sprintf(timeStr, "%7.1f", timeUsec);
-  } else {
-    sprintf(timeStr, "%7.2f", timeUsec);
-  }
-  if (args->reportErrors) {
-    PRINT("  %7s  %6.2f  %6.2f  %5g", timeStr, algBw, busBw, (double)wrongElts);
-  } else {
-    PRINT("  %7s  %6.2f  %6.2f  %5s", timeStr, algBw, busBw, "N/A");
-  }
+  char stTime[3][100];
+  sec2string(minMaxAvg[0], stTime[0]);
+  sec2string(minMaxAvg[1], stTime[1]);
+  sec2string(minMaxAvg[2], stTime[2]);
 
+  if (datacheck) {
+    PRINT("  %7s  %7s  %7s  %4d  %6.2f  %6.2f  %5.0le",
+	  stTime[0], stTime[1], stTime[2], minMaxIdx[1], algBw, busBw, maxDelta);
+  } else {
+    PRINT("  %7s  %7s  %7s  %4d  %6.2f  %6.2f  %5s",
+	  stTime[0], stTime[1], stTime[2], minMaxIdx[1], algBw, busBw, "N/A");
+  }
   args->bw[0] += busBw;
   args->bw_count[0]++;
   return testSuccess;
@@ -971,13 +1046,13 @@ testResult_t run() {
 
   fflush(stdout);
 
-  const char* timeStr = report_cputime ? "cputime" : "time";
   PRINT("#\n");
   PRINT("# %10s  %12s  %8s  %6s  %6s           out-of-place                       in-place          \n", "", "", "", "", "");
-  PRINT("# %10s  %12s  %8s  %6s  %6s  %7s  %6s  %6s %6s  %7s  %6s  %6s %6s\n", "size", "count", "type", "redop", "root",
-      timeStr, "algbw", "busbw", "#wrong", timeStr, "algbw", "busbw", "#wrong");
-  PRINT("# %10s  %12s  %8s  %6s  %6s  %7s  %6s  %6s  %5s  %7s  %6s  %6s  %5s\n", "(B)", "(elements)", "", "", "",
-      "(us)", "(GB/s)", "(GB/s)", "", "(us)", "(GB/s)", "(GB/s)", "");
+  PRINT("# %10s  %12s  %8s  %6s  %6s  %7s %7s %7s %4s  %6s  %6s %6s  %7s %7s %7s %4s  %6s  %6s %6s\n", "size", "count", "type", "redop", "root",
+      "min-lat", "max-lat", "avg-lat", "slow", "algbw", "busbw", "#wrong", "min-lat", "max-lat", "avg-lat", "slow", "algbw", "busbw", "#wrong");
+  PRINT("# %10s  %12s  %8s  %6s  %6s  %7s %7s %7s %4s  %6s  %6s %6s  %7s %7s %7s %4s  %6s  %6s  %5s\n", "(B)", "(elements)", "", "", "",
+      "(us)", "(us)", "(us)", " ", "(GB/s)", "(GB/s)", "",
+      "(us)", "(us)", "(us)", " ", "(GB/s)", "(GB/s)", "");
 
   struct testThread threads[nThreads];
   memset(threads, 0, sizeof(struct testThread)*nThreads);
