@@ -25,9 +25,15 @@ testResult_t SendRecvInitData(struct threadArgs* args, ncclDataType_t type, nccl
     int rank = ((args->proc*args->nThreads + args->thread)*args->nGpus + i);
     CUDACHECK(cudaMemset(args->recvbuffs[i], 0, args->expectedBytes));
     void* data = in_place ? args->recvbuffs[i] : args->sendbuffs[i];
+<<<<<<< HEAD
     TESTCHECK(InitData(data, sendcount, rank*sendcount, type, ncclSum, rep, 1, 0));
     int peer = (rank-1+nranks)%nranks;
     TESTCHECK(InitData(args->expected[i], recvcount, peer*recvcount, type, ncclSum, rep, 1, 0));
+=======
+    TESTCHECK(InitData(data, sendcount, type, rep, rank));
+    int peer = (rank-root+nranks)%nranks;
+    TESTCHECK(InitData(args->expected[i], recvcount, type, rep, peer));
+>>>>>>> 82a344c (sendrecv: Test different distances)
     CUDACHECK(cudaDeviceSynchronize());
   }
   // We don't support in-place sendrecv
@@ -48,8 +54,8 @@ testResult_t SendRecvRunColl(void* sendbuff, void* recvbuff, size_t count, ncclD
   NCCLCHECK(ncclCommCount(comm, &nRanks));
   int rank;
   NCCLCHECK(ncclCommUserRank(comm, &rank));
-  int recvPeer = (rank-1+nRanks) % nRanks;
-  int sendPeer = (rank+1) % nRanks;
+  int recvPeer = (rank-root+nRanks) % nRanks;
+  int sendPeer = (rank+root) % nRanks;
 
   NCCLCHECK(ncclGroupStart());
   NCCLCHECK(ncclSend(sendbuff, count, type, sendPeer, comm, stream));
@@ -77,6 +83,7 @@ testResult_t SendRecvRunTest(struct threadArgs* args, int root, ncclDataType_t t
   ncclRedOp_t *run_ops;
   const char **run_typenames, **run_opnames;
   int type_count, op_count;
+  int begin_root, end_root;
 
   if ((int)type != -1) {
     type_count = 1;
@@ -97,10 +104,18 @@ testResult_t SendRecvRunTest(struct threadArgs* args, int root, ncclDataType_t t
     run_ops = test_ops;
     run_opnames = test_opnames;
   }
+  if (root != -1) {
+    begin_root = end_root = root;
+  } else {
+    begin_root = 1;
+    end_root = args->nProcs*args->nThreads*args->nGpus-1;
+  }
 
   for (int i=0; i<type_count; i++) {
     for (int j=0; j<op_count; j++) {
-      TESTCHECK(TimeTest(args, run_types[i], run_typenames[i], run_ops[j], run_opnames[j], -1));
+      for (int rr=begin_root; rr<=end_root; rr++) {
+        TESTCHECK(TimeTest(args, run_types[i], run_typenames[i], run_ops[j], run_opnames[j], rr));
+      }
     }
   }
   return testSuccess;
