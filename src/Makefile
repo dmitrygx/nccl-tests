@@ -62,6 +62,10 @@ NVCUFLAGS += -I$(NCCL_HOME)/include/
 NVLDFLAGS += -L$(NCCL_HOME)/lib
 endif
 
+ifeq ($(SLOW_RANK_EMULATION), 1)
+NVCUFLAGS += -DSLOW_RANK_EMULATION
+endif
+
 ifeq ($(MPI), 1)
 NVCUFLAGS += -DMPI_SUPPORT -I$(MPI_HOME)/include
 NVLDFLAGS += -L$(MPI_HOME)/lib -L$(MPI_HOME)/lib64 -lmpi

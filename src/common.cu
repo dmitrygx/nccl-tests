@@ -77,6 +77,10 @@ static int parallel_init = 0;
 static int blocking_coll = 0;
 static int streamnull = 0;
 static int timeout = 0;
+#ifdef SLOW_RANK_EMULATION
+static int slow_rank = -1;
+static int slow_rank_usec = 100000;
+#endif
 static int cudaGraphLaunches = 0;
 static int report_cputime = 0;
 // Report average iteration time: (0=RANK0,1=AVG,2=MIN,3=MAX)
@@ -377,6 +381,12 @@ testResult_t startColl(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
       NCCLCHECK(ncclRedOpCreatePreMulSum(&op, &u64, type, ncclScalarHostImmediate, args->comms[i]));
     }
     #endif
+
+#ifdef SLOW_RANK_EMULATION
+    if (slow_rank == rank) {
+      usleep(slow_rank_usec);
+    }
+#endif
 
     TESTCHECK(args->collTest->runColl(
           (void*)(in_place ? recvBuff + args->sendInplaceOffset*rank : sendBuff),
@@ -735,13 +745,21 @@ int main(int argc, char* argv[]) {
     {"report_cputime", required_argument, 0, 'C'},
     {"average", required_argument, 0, 'a'},
     {"local_register", required_argument, 0, 'R'},
+#ifdef SLOW_RANK_EMULATION
+    {"slowrank", required_argument, 0, 'S'},
+    {"slowrank_delay", required_argument, 0, 'D'},
+#endif
     {"help", no_argument, 0, 'h'},
     {}
   };
 
   while(1) {
     int c;
-    c = getopt_long(argc, argv, "t:g:b:e:i:f:n:m:w:N:p:c:o:d:r:z:y:T:hG:C:a:R:", longopts, &longindex);
+    c = getopt_long(argc, argv,
+#ifdef SLOW_RANK_EMULATION
+		    "S:D:"
+#endif
+		    "t:g:b:e:i:f:n:m:w:N:p:c:o:d:r:z:y:T:hG:C:a:R:", longopts, &longindex);
 
     if (c == -1)
       break;
@@ -820,6 +838,14 @@ int main(int argc, char* argv[]) {
       case 'T':
         timeout = strtol(optarg, NULL, 0);
         break;
+#ifdef SLOW_RANK_EMULATION
+      case 'S':
+        slow_rank= (int)strtol(optarg, NULL, 0);
+        break;
+      case 'D':
+        slow_rank_usec= strtol(optarg, NULL, 0);
+        break;
+#endif
       case 'G':
 #if (NCCL_MAJOR > 2 || (NCCL_MAJOR >= 2 && NCCL_MINOR >= 9)) && CUDART_VERSION >= 11030
         cudaGraphLaunches = strtol(optarg, NULL, 0);
@@ -874,6 +900,10 @@ int main(int argc, char* argv[]) {
             "[-C,--report_cputime <0/1>] \n\t"
             "[-a,--average <0/1/2/3> report average iteration time <0=RANK0/1=AVG/2=MIN/3=MAX>] \n\t"
             "[-R,--local_register <1/0> enable local buffer registration on send/recv buffers (default: disable)] \n\t"
+#ifdef SLOW_RANK_EMULATION
+            "[-S slowrank <rank>] slow rank (default is disabled) \n\t"
+            "[-D slowrank_delay <usec>] slow rank delay usec \n\t"
+>>>>>>> 70a9a63... add slow rank simulation options
             "[-h,--help]\n",
           basename(argv[0]));
         return 0;
