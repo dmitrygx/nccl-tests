@@ -88,6 +88,9 @@ static int average = 1;
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,19,0)
 static int local_register = 0;
 #endif
+#ifdef OP_STATS
+static bool average_set = false;
+#endif
 
 #define NUM_BLOCKS 32
 
@@ -174,22 +177,49 @@ void Barrier(struct threadArgs *args) {
 // for average=0 (which means broadcast from rank=0) is dubious. The returned
 // value will actually be the result of process-local broadcast from the local thread=0.
 template<typename T>
-void Allreduce(struct threadArgs* args, T* value, int average) {
+void Allreduce(struct threadArgs* args, T* value, int *minMaxRank, int average) {
   thread_local int epoch = 0;
   static pthread_mutex_t lock[2] = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_MUTEX_INITIALIZER};
   static pthread_cond_t cond[2] = {PTHREAD_COND_INITIALIZER, PTHREAD_COND_INITIALIZER};
+  static struct {
+    T val;
+    int rank;
+  } accumulator_loc[2];
   static T accumulator[2];
   static int counter[2] = {0, 0};
+  int rank = args->proc*args->nThreads*args->nGpus + args->thread;
 
   pthread_mutex_lock(&lock[epoch]);
   if(counter[epoch] == 0) {
-    if(average != 0 || args->thread == 0) accumulator[epoch] = *value;
+    if(average != 0 || args->thread == 0) {
+      accumulator[epoch] = *value;
+      accumulator_loc[epoch].val = *value;
+      accumulator_loc[epoch].rank = rank;
+    }
   } else {
     switch(average) {
     case /*r0*/ 0: if(args->thread == 0) accumulator[epoch] = *value; break;
     case /*avg*/1: accumulator[epoch] += *value; break;
-    case /*min*/2: accumulator[epoch] = std::min<T>(accumulator[epoch], *value); break;
-    case /*max*/3: accumulator[epoch] = std::max<T>(accumulator[epoch], *value); break;
+    case /*min*/2:
+      accumulator[epoch] = std::min<T>(accumulator[epoch], *value);
+      if(accumulator_loc[epoch].val == accumulator[epoch]) {
+        accumulator_loc[epoch].rank == std::min<int>(accumulator_loc[epoch].rank, rank);
+      }
+      else {
+        accumulator_loc[epoch].val = accumulator[epoch];
+        accumulator_loc[epoch].rank = rank;
+      }
+      break;
+    case /*max*/3:
+      accumulator[epoch] = std::max<T>(accumulator[epoch], *value);
+      if(accumulator_loc[epoch].val == accumulator[epoch]) {
+        accumulator_loc[epoch].rank == std::min<int>(accumulator_loc[epoch].rank, rank);
+      }
+      else {
+        accumulator_loc[epoch].val = accumulator[epoch];
+        accumulator_loc[epoch].rank = rank;
+      }
+      break;
     case /*sum*/4: accumulator[epoch] += *value; break;
     }
   }
@@ -204,14 +234,15 @@ void Allreduce(struct threadArgs* args, T* value, int average) {
     #ifdef MPI_SUPPORT
     if(average != 0) {
       static_assert(std::is_same<T, long long>::value || std::is_same<T, double>::value, "Allreduce<T> only for T in {long long, double}");
-      MPI_Datatype ty = std::is_same<T, long long>::value ? MPI_LONG_LONG :
-                        std::is_same<T, double>::value ? MPI_DOUBLE :
+      MPI_Datatype ty = std::is_same<T, long long>::value ? ((average == 2 || average == 3) ? MPI_LONG_LONG_INT : MPI_LONG_LONG) :
+                        std::is_same<T, double>::value ? ((average == 2 || average == 3) ? MPI_DOUBLE_INT : MPI_DOUBLE) :
                         MPI_Datatype();
       MPI_Op op = average == 1 ? MPI_SUM :
-                  average == 2 ? MPI_MIN :
-                  average == 3 ? MPI_MAX :
+                  average == 2 ? MPI_MINLOC :
+                  average == 3 ? MPI_MAXLOC :
                   average == 4 ? MPI_SUM : MPI_Op();
-      MPI_Allreduce(MPI_IN_PLACE, (void*)&accumulator[epoch], 1, ty, op, MPI_COMM_WORLD);
+      void *accumulator_data = (average == 2 || average == 3) ? (void*)&accumulator_loc[epoch] : (void*)&accumulator[epoch];
+      MPI_Allreduce(MPI_IN_PLACE, accumulator_data, 1, ty, op, MPI_COMM_WORLD);
     }
     #endif
 
@@ -225,7 +256,8 @@ void Allreduce(struct threadArgs* args, T* value, int average) {
   }
   pthread_mutex_unlock(&lock[epoch]);
 
-  *value = accumulator[epoch];
+  *value = (average == 2 || average == 3) ? accumulator_loc[epoch].val : accumulator[epoch];
+  if(minMaxRank != NULL && (average == 2 || average == 3)) *minMaxRank = accumulator_loc[epoch].rank;
   epoch ^= 1;
 }
 
@@ -416,6 +448,20 @@ testResult_t completeColl(struct threadArgs* args) {
   return testSuccess;
 }
 
+#ifdef OP_STATS
+void sec2string(double timeSec, char *timeStr) {
+  double timeUsec = timeSec *1.0E6;
+
+  if (timeUsec >= 10000.0) {
+    sprintf(timeStr, "%7.0f", timeUsec);
+  } else if (timeUsec >= 100.0) {
+    sprintf(timeStr, "%7.1f", timeUsec);
+  } else {
+    sprintf(timeStr, "%7.2f", timeUsec);
+  }
+}
+#endif
+
 testResult_t BenchTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t op, int root, int in_place) {
   size_t count = args->nbytes / wordSize(type);
   if (datacheck) {
@@ -479,9 +525,26 @@ testResult_t BenchTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
   TESTCHECK(completeColl(args));
 
   double deltaSec = tim.elapsed();
-  deltaSec = deltaSec/(iters*agg_iters);
+  int rank;
+  const double deltaSecSaved = deltaSec = deltaSec/(iters*agg_iters);
   if (cudaGraphLaunches >= 1) deltaSec = deltaSec/cudaGraphLaunches;
-  Allreduce(args, &deltaSec, average);
+  Allreduce(args, &deltaSec, &rank, average);
+
+#ifdef OP_STATS
+  struct {
+    double min;
+    double max;
+    double avg;
+    int min_rank;
+    int max_rank;
+  } op_stat = { deltaSecSaved, deltaSecSaved, deltaSecSaved, -1, -1 };
+
+  if(!average_set) {
+    Allreduce(args, &op_stat.min, &op_stat.min_rank, 2);
+    Allreduce(args, &op_stat.max, &op_stat.max_rank, 3);
+    Allreduce(args, &op_stat.avg, NULL, 1);
+  }
+#endif
 
 #if CUDART_VERSION >= 11030
   if (cudaGraphLaunches >= 1) {
@@ -551,25 +614,46 @@ testResult_t BenchTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
       //aggregate delta from all threads and procs
       long long wrongElts1 = wrongElts;
       //if (wrongElts) fprintf(stderr, "\nERROR: Data corruption : rank %d size %ld wrongElts %ld\n", args->proc, args->expectedBytes, wrongElts);
-      Allreduce(args, &wrongElts1, /*sum*/4);
+      Allreduce(args, &wrongElts1, NULL, /*sum*/4);
       wrongElts = wrongElts1;
       if (wrongElts) break;
   }
 
-  double timeUsec = (report_cputime ? cputimeSec : deltaSec)*1.0E6;
-  char timeStr[100];
-  if (timeUsec >= 10000.0) {
-    sprintf(timeStr, "%7.0f", timeUsec);
-  } else if (timeUsec >= 100.0) {
-    sprintf(timeStr, "%7.1f", timeUsec);
-  } else {
-    sprintf(timeStr, "%7.2f", timeUsec);
+#ifdef OP_STATS
+  if(!average_set) {
+    char minTimeStr[100], maxTimeStr[100], avgTimeStr[100];
+    sec2string(op_stat.min, minTimeStr);
+    sec2string(op_stat.max, maxTimeStr);
+    sec2string(op_stat.avg, avgTimeStr);
+
+    if (datacheck) {
+      PRINT("  %7s  %7s  %7s  %8d  %8d  %6.2f  %6.2f  %5g",
+	          minTimeStr, maxTimeStr, avgTimeStr, op_stat.min_rank, op_stat.max_rank, algBw, busBw, (double)wrongElts);
+    }
+    else {
+      PRINT("  %7s  %7s  %7s  %8d  %8d  %6.2f  %6.2f  %5s",
+	          minTimeStr, maxTimeStr, avgTimeStr, op_stat.min_rank, op_stat.max_rank, algBw, busBw, "N/A");
+    }
   }
-  if (args->reportErrors) {
-    PRINT("  %7s  %6.2f  %6.2f  %5g", timeStr, algBw, busBw, (double)wrongElts);
-  } else {
-    PRINT("  %7s  %6.2f  %6.2f  %5s", timeStr, algBw, busBw, "N/A");
+  else {
+#endif
+    double timeUsec = (report_cputime ? cputimeSec : deltaSec)*1.0E6;
+    char timeStr[100];
+    if (timeUsec >= 10000.0) {
+      sprintf(timeStr, "%7.0f", timeUsec);
+    } else if (timeUsec >= 100.0) {
+      sprintf(timeStr, "%7.1f", timeUsec);
+    } else {
+      sprintf(timeStr, "%7.2f", timeUsec);
+    }
+    if (args->reportErrors) {
+      PRINT("  %7s  %6.2f  %6.2f  %5g", timeStr, algBw, busBw, (double)wrongElts);
+    } else {
+      PRINT("  %7s  %6.2f  %6.2f  %5s", timeStr, algBw, busBw, "N/A");
+    }
+#ifdef OP_STATS
   }
+#endif
 
   args->bw[0] += busBw;
   args->bw_count[0]++;
@@ -858,6 +942,9 @@ int main(int argc, char* argv[]) {
         break;
       case 'a':
         average = (int)strtol(optarg, NULL, 0);
+#ifdef OP_STATS
+        average_set = true;
+#endif
         break;
       case 'R':
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,19,0)
@@ -903,7 +990,7 @@ int main(int argc, char* argv[]) {
 #ifdef SLOW_RANK_EMULATION
             "[-S slowrank <rank>] slow rank (default is disabled) \n\t"
             "[-D slowrank_delay <usec>] slow rank delay usec \n\t"
->>>>>>> 70a9a63... add slow rank simulation options
+#endif
             "[-h,--help]\n",
           basename(argv[0]));
         return 0;
@@ -1063,13 +1150,29 @@ testResult_t run() {
 
   fflush(stdout);
 
-  const char* timeStr = report_cputime ? "cputime" : "time";
-  PRINT("#\n");
-  PRINT("# %10s  %12s  %8s  %6s  %6s           out-of-place                       in-place          \n", "", "", "", "", "");
-  PRINT("# %10s  %12s  %8s  %6s  %6s  %7s  %6s  %6s %6s  %7s  %6s  %6s %6s\n", "size", "count", "type", "redop", "root",
-      timeStr, "algbw", "busbw", "#wrong", timeStr, "algbw", "busbw", "#wrong");
-  PRINT("# %10s  %12s  %8s  %6s  %6s  %7s  %6s  %6s  %5s  %7s  %6s  %6s  %5s\n", "(B)", "(elements)", "", "", "",
-      "(us)", "(GB/s)", "(GB/s)", "", "(us)", "(GB/s)", "(GB/s)", "");
+#ifdef OP_STATS
+  if(!average_set) {
+    PRINT("#\n");
+    PRINT("# %10s  %12s  %8s  %6s  %6s           out-of-place                       in-place          \n", "", "", "", "", "");
+    PRINT("# %10s  %12s  %8s  %6s  %6s  %7s  %7s  %7s  %8s  %8s  %6s  %6s  %6s  %7s  %7s  %7s  %8s  %8s  %6s  %6s  %6s\n", "size", "count", "type", "redop", "root",
+          "min-lat", "max-lat", "avg-lat", "min-rank", "max-rank", "algbw", "busbw", "#wrong",
+          "min-lat", "max-lat", "avg-lat", "min-rank", "max-rank", "algbw", "busbw", "#wrong");
+    PRINT("# %10s  %12s  %8s  %6s  %6s  %7s  %7s  %7s  %8s  %8s  %6s  %6s  %6s  %7s  %7s  %7s  %8s  %8s  %6s  %6s  %6s\n", "(B)", "(elements)", "", "", "",
+          "(us)", "(us)", "(us)", " ", " ", "(GB/s)", "(GB/s)", "",
+          "(us)", "(us)", "(us)", " ", " ", "(GB/s)", "(GB/s)", "");
+  }
+  else {
+#endif
+    const char* timeStr = report_cputime ? "cputime" : "time";
+    PRINT("#\n");
+    PRINT("# %10s  %12s  %8s  %6s  %6s           out-of-place                       in-place          \n", "", "", "", "", "");
+    PRINT("# %10s  %12s  %8s  %6s  %6s  %7s  %6s  %6s %6s  %7s  %6s  %6s %6s\n", "size", "count", "type", "redop", "root",
+          timeStr, "algbw", "busbw", "#wrong", timeStr, "algbw", "busbw", "#wrong");
+    PRINT("# %10s  %12s  %8s  %6s  %6s  %7s  %6s  %6s  %5s  %7s  %6s  %6s  %5s\n", "(B)", "(elements)", "", "", "",
+         "(us)", "(GB/s)", "(GB/s)", "", "(us)", "(GB/s)", "(GB/s)", "");
+#ifdef OP_STATS
+  }
+#endif
 
   struct testThread threads[nThreads];
   memset(threads, 0, sizeof(struct testThread)*nThreads);

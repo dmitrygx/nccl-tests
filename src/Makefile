@@ -66,6 +66,10 @@ ifeq ($(SLOW_RANK_EMULATION), 1)
 NVCUFLAGS += -DSLOW_RANK_EMULATION
 endif
 
+ifeq ($(OP_STATS), 1)
+NVCUFLAGS += -DOP_STATS
+endif
+
 ifeq ($(MPI), 1)
 NVCUFLAGS += -DMPI_SUPPORT -I$(MPI_HOME)/include
 NVLDFLAGS += -L$(MPI_HOME)/lib -L$(MPI_HOME)/lib64 -lmpi
